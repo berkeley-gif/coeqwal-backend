@@ -1,0 +1,13 @@
+short+AF8-code,title,category,description,source,source+AF8-access+AF8-date,file,assumptions+AF8-version+AF8-id,is+AF8-active,notes,created+AF8-by,updated+AF8-by
+TUCP+AF8-TUCO,TUCP's and TUCO's,TUCP+AF8-TUCO,,,,,1,1,,1,
+lu+AF8-2004+AF8-2013,2004+AC0-2013 land use model,land+AF8-use,,,,,1,1,,1,
+lu+AF8-updated,Updated land use model,land+AF8-use,,,,,1,1,,1,
+lu+AF8-updated+AF8-SJV+AF8-irr+AF8-reduct,Updated land use model with reduced irrigated agricultural land in the San Joaquin Valley,land+AF8-use,,,,,1,1,,1,
+lu+AF8-updated+AF8-SAC+AF8-irr+AF8-reduct,Updated land use model with reduced irrigated agricultural land in the Sacramento Valley,land+AF8-use,,,,,1,1,,1,
+lu+AF8-updated+AF8-CV+AF8-irr+AF8-reduct,Updated land use model with reduced irrigated agricultural land in the Central Valley,land+AF8-use,,,,,1,1,,1,
+SGMA+AF8-SJV,San Joaquin Valley SGMA reductions,gw+AF8-restrictions,,,,,1,1,,1,
+SGMA+AF8-SAC,Sacramento Valley SGMA+AC0-type reductions,gw+AF8-restrictions,,,,,1,1,,1,
+SGMA+AF8-CV,Central Valley+AC0-wide SGMA+AC0-type reductions,gw+AF8-restrictions,,,,,1,1,,1,
+slr,sea level rise,slr,,,,,1,1,,1,
+gw+AF8-model,groundwater model,gw+AF8-model,,,,,1,1,,1,
+DCP,+ACI-Delta Conveyance Project (+ACIAIg-The Tunnel+ACIAIg-)+ACI-,infrastructure,,,,,1,1,,1,

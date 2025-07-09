@@ -1,0 +1,2365 @@
+//────────────────────────────────────────────
+// VERSIONING
+//────────────────────────────────────────────
+
+Table version_family {
+  id          int   [pk, increment]
+  short_code  text  [not null, unique]  // 'theme', 'scenario', …
+  label       text
+  description text
+  is_active   boolean [not null, default: true]
+
+  created_at  timestamp [default: "now()"]
+  created_by  int
+  updated_at  timestamp
+  updated_by  int
+
+  Indexes { (is_active, short_code) }
+
+  Note: 'Version families define domains that can be versioned independently (theme, scenario, assumption, etc.)'
+}
+
+Ref: version_family.created_by > user.id [delete: restrict, update: cascade]
+Ref: version_family.updated_by > user.id [delete: restrict, update: cascade]
+
+Table domain_family_map {
+  table_name        text [pk]
+  version_family_id int  [not null]
+  note              text
+
+  Note: 'Maps individual tables to their version families. Enables tooling to fetch latest active version for any domain table.'
+}
+
+Ref: domain_family_map.version_family_id > version_family.id [delete: restrict, update: cascade]
+
+Table version {
+  id                int       [pk, increment]
+  version_family_id int       [not null]
+  version_number    text      // semver e.g. 2.1.0; use pg_semver extension
+  manifest          jsonb     // Version metadata: config, feature flags, validation rules, etc.
+  changelog         text      // Human-readable change description
+  is_active         boolean   [not null, default: false]
+  created_at  timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [default: "now()"]
+  updated_by  int
+
+  Indexes {
+    (version_family_id, version_number) [unique]
+    (version_family_id) [unique, note: 'Postgres partial index WHERE is_active = TRUE']
+  }
+
+  Note: 'Version instances for each family. Only one version per family can be active at a time.'
+}
+
+Ref: version.version_family_id > version_family.id [delete: restrict, update: cascade]
+Ref: version.created_by > user.id [delete: restrict, update: cascade]
+Ref: version.updated_by > user.id [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// GLOBAL LOOKUP TABLES & ENUMS
+//────────────────────────────────────────────
+
+Table user {
+  id           int       [pk, increment]
+  email        text      [unique]                      // Primary email address
+  name         text
+  display_name text      [not null]                    // Full name or service description
+  affiliation  text                                    // Organization/institution
+  role         text                                    // 'researcher', 'analyst', 'admin', 'service'
+  
+  // AWS SSO Integration (for production)
+  aws_sso_user_id  text  [unique]                     // AWS SSO user ID (populated post-deployment)
+  aws_sso_username text  [unique]                     // AWS SSO username (populated post-deployment)
+  
+  // Bootstrap vs Production user tracking
+  is_bootstrap boolean   [not null, default: false]   // TRUE for CSV bootstrap users
+  sync_source  text      [default: 'manual']          // 'manual', 'aws_sso', 'bootstrap'
+  
+  // Status and metadata
+  is_active    boolean   [not null, default: true]
+  last_login   timestamp
+  created_at   timestamp [not null, default: "now()"]
+  updated_at   timestamp [not null, default: "now()"]
+
+  Indexes {
+    (email) [unique]
+    (aws_sso_user_id) [unique]
+    (aws_sso_username) [unique]
+    (role, is_active)
+    (is_bootstrap, is_active)
+    (sync_source, is_active)
+  }
+
+  Note: 'Hybrid user table: Bootstrap users (CSV) for initialization, AWS SSO integration for production. Bootstrap users can be deactivated after AWS SSO sync.'
+}
+
+Ref: source.created_by > user.id [delete: restrict, update: cascade]
+Ref: source.updated_by > user.id [delete: restrict, update: cascade]
+
+Table source {
+    id          int     [pk, increment]
+    source      text    [not null, unique]   // 'calsim_report', 'james_gilbert', 'calsim_variables', 'geopackage', 'trend_report'
+    description text                          // Description of the data source
+    is_active   boolean [not null, default: true]
+    
+    created_at  timestamp [default: "now()"]
+    created_by  int      [not null]
+    updated_at  timestamp
+    updated_by  int
+
+    Indexes {
+        (source) [unique]
+        (is_active, source)
+    }
+
+    Note: 'Unified source lookup table for all entity types'
+}
+
+Table entity_source_link {
+  entity_id     uuid    [not null]           // FK → calsim_entity.id
+  source_id     int     [not null]           // FK → source.id
+  notes         text                         // Source-specific notes or context
+  
+  created_at    timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at    timestamp
+  updated_by  int
+
+  Indexes {
+    (entity_id, source_id) [pk]
+    (source_id, entity_id)           // Find entities by source
+    (entity_id)                      // All sources for entity
+    (source_id)                      // All entities for source
+  }
+
+  Note: 'Universal junction table for tracking which sources provide data for each entity. Replaces individual source_id fields and JSON sources arrays across all entity types.'
+}
+
+Ref: entity_source_link.entity_id  > calsim_entity.id [delete: cascade, update: cascade]
+Ref: entity_source_link.source_id  > source.id        [delete: restrict, update: cascade]
+Ref: entity_source_link.created_by > user.id          [delete: restrict, update: cascade]
+Ref: entity_source_link.updated_by > user.id          [delete: restrict, update: cascade]
+
+Table calsim_entity_type {
+  id                  int   [pk, increment]
+  type                text  [not null, unique]   // 'reservoir', 'channel', 'inflow', 'demand_unit', 'groundwater', 'delta_node'
+  schematic_type_id   int                        // FK → calsim_schematic_type.id  (NULL → not on network)
+  description         text 
+  key_dynamic         text
+  is_active           boolean [default: true]
+
+  Indexes { (is_active, type) }
+}
+Ref: calsim_entity_type.schematic_type_id > calsim_schematic_type.id
+
+Table calsim_schematic_type {
+  id          int  [pk, increment]
+  label  text [not null, unique]   // 'arc', 'node', null
+}
+
+//────────────────────────────────────────────
+// CALSIM ENTITIES SYSTEM
+//────────────────────────────────────────────
+
+// General entity table for all CalSim entities
+Table calsim_entity {
+  id                   uuid      [pk]
+  short_code           text      [not null, unique]   // "SHSTA", "SAC", "D_DEMAND01"
+  name                 text      [not null]           // "Shasta Reservoir", "Sacramento River"
+  entity_type_id       int       [not null]           // FK → calsim_entity_type.id
+  hydrologic_region_id int                            // FK → hydrologic_region.id
+  geometry             geometry(Geometry,4326)        // Point, LineString, Polygon as appropriate
+  metadata             jsonb                          // Entity-specific attributes
+  is_active            boolean   [not null, default: true]
+  
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (short_code) [unique]
+    (entity_type_id)
+    (hydrologic_region_id)
+    (geometry) [type: gist]
+    (is_active)
+  }
+}
+
+Ref: calsim_entity.entity_type_id       > calsim_entity_type.id [delete: restrict, update: cascade]
+Ref: calsim_entity.hydrologic_region_id > hydrologic_region.id  [delete: restrict, update: cascade]
+Ref: calsim_entity.created_by           > user.id          [delete: restrict, update: cascade]
+Ref: calsim_entity.updated_by           > user.id          [delete: restrict, update: cascade]
+
+// Link variables to entities
+Table calsim_entity_variable_link {
+  entity_id       uuid [not null]           // FK → calsim_entity.id
+  variable_id     uuid [not null]           // FK → calsim_variable.id
+  is_primary      boolean [default: false]  // TRUE for main variables (e.g., S_SHSTA is primary storage for SHSTA)
+  variable_purpose text                     // 'scenario_flow', 'unimpaired_flow', 'minimum_flow', 'storage_level', 'storage_zone'
+  priority_order  int                       // 1=primary, 2=secondary, etc. for ordering multiple variables of same purpose
+  notes           text                      // Context about this variable's role for the entity
+  
+  created_at  timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp
+  updated_by  int
+
+  Indexes {
+    (entity_id, variable_id) [pk]
+    (variable_id, entity_id)
+    (entity_id, is_primary)              // Find primary variables for entity
+    (entity_id, variable_purpose)        // Find variables by purpose for entity
+    (variable_purpose, priority_order)   // Order variables within purpose
+  }
+}
+
+Ref: calsim_entity_variable_link.entity_id   > calsim_entity.id    [delete: cascade, update: cascade]
+Ref: calsim_entity_variable_link.variable_id > calsim_variable.id  [delete: cascade, update: cascade]
+Ref: calsim_entity_variable_link.created_by  > user.id     [delete: restrict, update: cascade]
+Ref: calsim_entity_variable_link.updated_by  > user.id     [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// ENTITY-SPECIFIC ATTRIBUTE TABLES
+//────────────────────────────────────────────
+
+Table channel {
+  id                   int    [pk, increment]
+  entity_id            uuid   [not null, unique]    // FK → calsim_entity.id
+  channel_type         text                         // 'natural', 'canal', 'aqueduct'
+  length_miles         numeric
+  capacity_cfs         numeric
+  
+  created_at  timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp
+  updated_by  int
+}
+
+Ref: channel.entity_id  > calsim_entity.id  [delete: cascade, update: cascade]
+Ref: channel.created_by > user.id   [delete: restrict, update: cascade]
+Ref: channel.updated_by > user.id   [delete: restrict, update: cascade]
+
+Table demand_unit {
+  id                   int    [pk, increment]
+  entity_id            uuid   [not null, unique]    // FK → calsim_entity.id
+  demand_type          text                         // 'urban', 'agricultural', 'environmental'
+  service_area_acres   numeric
+  population           int
+  crop_type            text                         // For agricultural demands
+  
+  created_at  timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp
+  updated_by  int
+}
+
+Ref: demand_unit.entity_id  > calsim_entity.id  [delete: cascade, update: cascade]
+Ref: demand_unit.created_by > user.id   [delete: restrict, update: cascade]
+Ref: demand_unit.updated_by > user.id   [delete: restrict, update: cascade]
+
+Table hydrologic_region {
+  id         int  [pk, increment]
+  short_code text [not null, unique]   // 'SAC' | 'SJR' | 'Tul' | 'SoCal'
+  label      text                      // full name ("Sacramento River", …)
+
+  Indexes { (short_code) }
+}
+
+Table unit {
+   id              int     [pk, increment]
+   short_code      text    [not null, unique] // "cfs", "taf"
+   full_name       text
+   canonical_group text    // "flow", "volume", "length"
+ }
+
+ Table flow_regime {
+   id          int   [pk, increment]
+   short_code  text  [not null, unique] // "dry_early"
+   description text
+ }
+
+ Table season {
+   id          int   [pk, increment]
+   label       text  [not null, unique]  // "OND", "spring"
+   start_month int   // 1-12  (optional)
+   end_month   int
+   notes       text
+ }
+
+ Table region {
+   id          int   [pk, increment]
+   primary_name text [not null, unique]
+   type        text
+   alias_names text[]
+   geom        geometry(Geometry,4326)
+ }
+
+ // reservoir_group table removed - was redundant and underutilized
+
+Table hydroclimate_variable_type {
+  id          int  [pk, increment]
+  short_code  text [not null, unique]   // 'temperature', …
+  unit_id     int                      // e.g. '°C'
+  unit_hint   text                      // e.g. , 'mm day-1'
+  description text
+  is_active   boolean [default: true]
+
+  Indexes { (is_active, short_code) }
+}
+
+Ref: hydroclimate_variable_type.unit_id > unit.id [delete: restrict, update: cascade]
+
+/*
+Enum hydroclimate_variable_type {
+  temperature
+  precipitation
+  evapotranspiration
+  streamflow
+  other
+}
+*/
+
+Table variable_type {
+  id          int  [pk, increment]
+  short_code  text [not null, unique]   // 'output', 'control', 'decision', 'input'
+  label       text [not null]           // 'Model Output', 'Control Variable', 'Decision Variable'
+  description text
+  is_active   boolean [default: true]
+
+  created_at  timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp
+  updated_by  int
+
+  Indexes { (is_active, short_code) }
+}
+
+Ref: variable_type.created_by > user.id [delete: restrict, update: cascade]
+Ref: variable_type.updated_by > user.id [delete: restrict, update: cascade]
+
+/*
+Enum variable_frequency_type {
+  monthly
+  seasonal    // e.g. "spring"
+  flow_seasonal // e.g. "dry_early"
+  annual
+  other
+}
+*/
+
+Table analysis_type {
+  id          int  [pk, increment]
+  short_code  text [not null, unique]   // 'cobenefit', …
+  label       text
+  description text
+  is_active   boolean [default: true]
+
+  Indexes { (is_active, short_code) }
+}
+
+/*
+Enum analysis_type {
+  cobenefit
+  tradeoff
+  deviation
+  important
+  other
+}
+*/
+
+Table geometry_type {
+  id          int  [pk, increment]
+  short_code  text [not null, unique]
+  label       text
+  description text
+  is_active   boolean [default: true]
+
+  Indexes { (is_active, short_code) }
+}
+
+/*
+Enum geometry_type {
+  demand_unit
+  wba
+  hydrologic_area
+  basin
+  reservoir
+  stream
+  aquifer
+  other
+}
+*/
+
+Table statistic_type {
+  id          int    [pk, increment]
+  code        text   [not null, unique] // e.g. 'p10'
+  name        text   [not null]         // e.g. '10th percentile'
+  description text
+  is_percentile boolean [not null, default: false]
+
+  created_at  timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (code)        [unique]
+  }
+}
+
+Ref: statistic_type.created_by > user.id  [delete: restrict, update: cascade]
+Ref: statistic_type.updated_by > user.id  [delete: restrict, update: cascade]
+
+/*
+INSERT INTO statistic_type (code, name, is_percentile, created_by, updated_by)
+VALUES
+  ('mean',   'Mean',                  FALSE, :system_user, :system_user),
+  ('median', 'Median',                FALSE, :system_user, :system_user),
+  ('min',    'Minimum',               FALSE, :system_user, :system_user),
+  ('max',    'Maximum',               FALSE, :system_user, :system_user),
+  ('p05',    '5th percentile',        TRUE,  :system_user, :system_user),
+  ('p10',    '10th percentile',       TRUE,  :system_user, :system_user),
+  ('p25',    '25th percentile',       TRUE,  :system_user, :system_user),
+  ('p75',    '75th percentile',       TRUE,  :system_user, :system_user),
+  ('p90',    '90th percentile',       TRUE,  :system_user, :system_user),
+  ('p95',    '95th percentile',       TRUE,  :system_user, :system_user),
+  ('other',  'Other / custom value',  FALSE, :system_user, :system_user);
+
+-- Variable types for categorizing variables by purpose
+INSERT INTO variable_type (short_code, label, description, created_by, updated_by)
+VALUES
+  ('output', 'Model Output', 'Standard CalSim model output variables (flows, storage, etc.)', :system_user, :system_user),
+  ('control', 'Control Variable', 'Operational control indicators and binary flags', :system_user, :system_user),
+  ('decision', 'Decision Variable', 'Model decision variables and optimization targets', :system_user, :system_user),
+  ('state', 'State Variable', 'State variables including storage zones and bookkeeping accounts', :system_user, :system_user),
+  ('input', 'Input Variable', 'External inputs and boundary conditions', :system_user, :system_user),
+  ('intermediate', 'Intermediate Variable', 'Calculated intermediate values used in model logic', :system_user, :system_user),
+  ('aggregate', 'Aggregate Variable', 'Variables that sum or combine multiple reservoir/system components', :system_user, :system_user);
+  */
+
+//────────────────────────────────────────────
+// CORE ENTITIES
+//────────────────────────────────────────────
+
+Table theme {
+  id          int       [pk, increment]
+  short_code  text      [not null]
+  is_active   boolean   [not null, default: false]
+  title       text      [not null]
+  subtitle    text
+  simple_description text
+  description text
+  description_next text
+  narrative   jsonb
+  outcome_description text
+  outcome_narrative text
+  source text
+  theme_version_id int       [not null]
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (short_code, is_active) [unique, note: 'UNIQUE WHERE is_active = TRUE']
+    (is_active)
+  }
+}
+
+Ref: theme.theme_version_id > version.id [delete: restrict, update: cascade]
+Ref: theme.created_by > user.id [delete: restrict, update: cascade]
+Ref: theme.updated_by > user.id [delete: restrict, update: cascade]
+
+Table scenario {
+  id                   int      [pk]
+  short_code           text      [not null]
+  is_active            boolean   [not null, default: false]
+  title                text      [not null]
+  subtitle             text
+  short_description    text
+  description          text
+  narrative            jsonb
+  baseline_scenario_id int                // NULL for baselines
+  hydroclimate_id      int
+  source_id             int
+  scenario_version_id  int       [not null]
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (short_code, is_active) [unique, note: 'UNIQUE WHERE is_active = TRUE']
+    (is_active)
+    (baseline_scenario_id)
+    (hydroclimate_id)
+  }
+}
+
+Ref: scenario.baseline_scenario_id > scenario.id [delete: set null, update: cascade]
+Ref: scenario.hydroclimate_id > hydroclimate.id [delete: restrict, update: cascade]
+Ref: scenario.scenario_version_id > version.id [delete: restrict, update: cascade]
+Ref: scenario.created_by > user.id    [delete: restrict, update: cascade]
+Ref: scenario.updated_by > user.id    [delete: restrict, update: cascade]
+
+// Theme ↔ Scenario
+Table theme_scenario_link {
+  theme_id    int  [not null]
+  scenario_id uuid [not null]
+
+  Indexes { 
+    (theme_id, scenario_id) [pk]      // scenarios per theme
+    (scenario_id, theme_id)           // themes per scenario
+  }
+}
+
+Ref: theme_scenario_link.theme_id    > theme.id    [delete: restrict, update: cascade]
+Ref: theme_scenario_link.scenario_id > scenario.id [delete: restrict, update: cascade]
+
+Table theme_source {
+  id            int   [pk, increment]
+  short_code    text  [not null, unique]
+  name          text  [not null]              // e.g. "May 2025 Advisory Cohort Posters"
+  citation      text                         
+  url           text
+  doc_date      date
+  notes         text
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+}
+
+Ref: theme_source.created_by > user.id [delete: restrict, update: cascade]
+Ref: theme_source.updated_by > user.id [delete: restrict, update: cascade]
+
+// Theme ↔ Theme Source
+Table theme_source_link {
+  theme_id   int  [not null]
+  theme_source_id  int  [not null]
+}
+
+Ref: theme_source_link.theme_id > theme.id [delete: restrict, update: cascade]
+Ref: theme_source_link.theme_source_id > theme_source.id [delete: restrict, update: cascade]
+
+Table scenario_source {
+  id            int   [pk, increment]
+  short_code    text  [not null, unique]
+  name          text  [not null]              // e.g. "COEQWAL_phase1_Gilbert"
+  citation      text                         
+  url           text
+  doc_date          date
+  notes         text
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+}
+
+Ref: scenario_source.created_by > user.id [delete: restrict, update: cascade]
+Ref: scenario_source.updated_by > user.id [delete: restrict, update: cascade]
+
+// Scenario ↔ Scenario Source
+Table scenario_source_link {
+  scenario_id uuid [not null]
+  scenario_source_id   int  [not null]
+}
+
+Ref: scenario_source_link.scenario_id > scenario.id [delete: restrict, update: cascade]
+Ref: scenario_source_link.scenario_source_id > scenario_source.id [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// ASSUMPTIONS
+//────────────────────────────────────────────
+
+Table assumption_category {
+  id          int    [pk, increment]
+  short_code        text   [not null, unique]  // slr, land_use, etc.
+  label       text   [not null] 
+  description text
+  is_active   boolean   [not null, default: true]
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (is_active, short_code)
+  }
+}
+
+Ref: assumption_category.created_by > user.id [delete: restrict, update: cascade]
+Ref: assumption_category.updated_by > user.id [delete: restrict, update: cascade]
+
+/*
+
+INSERT INTO assumption_category (short_code, label)
+VALUES
+  ('tucp_tuco',       'TUCP/TUCO'),
+  ('land_use',        'land use'),
+  ('gw_restrictions', 'groundwater restrictions'),
+  ('slr',             'sea level rise'),
+  ('gwmodel',         'groundwater model'),
+  ('other',           'other');
+
+*/
+
+Table assumption_definition {
+  id                int   [pk, increment]
+  short_code        text  [not null]
+  title             text  [not null]
+  category_id       int   [not null]
+  description       text
+  source            text
+  source_access_date date
+  file              text
+  assumptions_version_id int [not null]
+  is_active   boolean   [not null, default: true]
+  notes       text
+  created_at  timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp
+  updated_by  int
+
+  Indexes {
+    (category_id, short_code) [unique, note: 'UNIQUE WHERE is_active']
+    (is_active)
+  }
+}
+
+Ref: assumption_definition.category_id > assumption_category.id [delete: restrict, update: cascade]
+Ref: assumption_definition.assumptions_version_id > version.id [delete: restrict, update: cascade]
+Ref: assumption_definition.created_by > user.id [delete: restrict, update: cascade]
+Ref: assumption_definition.updated_by > user.id [delete: restrict, update: cascade]
+
+Table assumption_param_TUCP_TUCO {
+  id              int  [pk, increment]
+  assumption_id int  [not null]
+  region_id   int
+  season_id   int
+  detail       jsonb
+
+  Indexes { (assumption_id) }
+}
+
+Ref: assumption_param_TUCP_TUCO.assumption_id > assumption_definition.id [delete: cascade, update: restrict]
+Ref: assumption_param_TUCP_TUCO.region_id > region.id [delete: restrict, update: cascade]
+Ref: assumption_param_TUCP_TUCO.season_id > season.id [delete: restrict, update: cascade]
+
+Table assumption_param_land_use {
+  id              int  [pk, increment]
+  assumption_id int       [not null]
+  crop          text
+  amount      numeric
+  unit_id     int
+  region_id   int
+  season_id   int
+  detail       jsonb
+  Indexes { (assumption_id, crop) [unique] }
+}
+
+Ref: assumption_param_land_use.assumption_id > assumption_definition.id [delete: cascade, update: restrict]
+Ref: assumption_param_land_use.unit_id > unit.id [delete: restrict, update: cascade]
+Ref: assumption_param_land_use.season_id > season.id [delete: restrict, update: cascade]
+
+Table assumption_param_SGMA {
+  id              int  [pk, increment]
+  assumption_id int       [not null]
+  region_id  int
+  amount    numeric
+  unit_id int
+  detail jsonb
+  Indexes { (assumption_id, region_id) [unique] }
+}
+
+Ref: assumption_param_SGMA.assumption_id > assumption_definition.id [delete: cascade, update: restrict]
+Ref: assumption_param_SGMA.region_id > region.id [delete: restrict, update: cascade]
+Ref: assumption_param_SGMA.unit_id > unit.id [delete: restrict, update: cascade]
+
+Table assumption_param_slr {
+  id              int  [pk, increment]
+  assumption_id  int       [not null]
+  projection_year int
+  slr         numeric
+  unit_id     int
+  detail jsonb
+  Indexes { (assumption_id, slr, unit_id) [unique] }
+}
+
+Ref: assumption_param_slr.assumption_id > assumption_definition.id [delete: cascade, update: restrict]
+Ref: assumption_param_slr.unit_id > unit.id [delete: restrict, update: cascade]
+
+Table assumption_param_gwmodel {
+  id              int  [pk, increment]
+  assumption_id int       [not null]
+  detail        jsonb
+  Indexes { (assumption_id) }
+}
+
+Ref: assumption_param_gwmodel.assumption_id > assumption_definition.id [delete: cascade, update: restrict]
+
+Table assumption_param_bioops {
+  id              int  [pk, increment]
+  assumption_id int       [not null]
+  detail        jsonb
+  Indexes { (assumption_id) }
+}
+
+Ref: assumption_param_bioops.assumption_id > assumption_definition.id [delete: cascade, update: restrict]
+
+Table assumption_param_kv {
+  id              int  [pk, increment]
+  assumption_id int       [not null]
+  key           text      [not null]
+  value_num     numeric
+  value_txt     text
+  Note: 'CHECK ( (value_num IS NOT NULL)::int + (value_txt IS NOT NULL)::int = 1 )'
+
+  unit_id       int
+  region_id     int
+  season_id     int
+  detail       jsonb
+
+  Indexes {
+    (assumption_id, key) [unique]
+  }
+}
+
+Ref: assumption_param_kv.assumption_id > assumption_definition.id [delete: cascade, update: restrict]
+Ref: assumption_param_kv.unit_id > unit.id [delete: restrict, update: cascade]
+Ref: assumption_param_kv.region_id > region.id [delete: restrict, update: cascade]
+Ref: assumption_param_kv.season_id > season.id [delete: restrict, update: cascade]
+
+Table theme_key_assumption_link {
+  theme_id                 int  [not null]
+  assumption_definition_id int  [not null]
+
+  Indexes {
+    (theme_id, assumption_definition_id) [pk]      // theme → assumptions
+    (assumption_definition_id, theme_id)           // assumption → themes
+  }
+}
+
+Ref: theme_key_assumption_link.theme_id                 > theme.id                 [delete: restrict, update: cascade]
+Ref: theme_key_assumption_link.assumption_definition_id > assumption_definition.id [delete: restrict, update: cascade]
+
+Table scenario_key_assumption_link {
+  scenario_id   uuid [not null]
+  assumption_id int  [not null]
+
+  Indexes {
+    (scenario_id, assumption_id) [pk]   // scenario → assumptions
+    (assumption_id, scenario_id)        // assumption → scenarios
+  }
+}
+
+Ref: scenario_key_assumption_link.scenario_id  > scenario.id            [delete: restrict, update: cascade]
+Ref: scenario_key_assumption_link.assumption_id > assumption_definition.id [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// OPERATIONS
+//────────────────────────────────────────────
+
+Table operation_category {
+  id          int  [pk, increment]
+  short_code  text [not null, unique]
+  name        text
+  description text
+  is_active   boolean [not null, default: true]
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes { (is_active, short_code) }
+}
+  
+Ref: operation_category.created_by > user.id [delete: restrict, update: cascade]
+Ref: operation_category.updated_by > user.id [delete: restrict, update: cascade]
+
+/*
+INSERT INTO operation_category (short_code, label)
+VALUES
+  ('infrastructure',       'infrastructure'),
+  ('regulatory',        'regulatory'),
+  ('priority_allocation', 'priority allocation),
+  ('min_flow',             'minimum flow'),
+  ('gw_pumping_limit',         'groundwater pumping limit]'),
+  ('ag_delivery',         'agricultural delivery]'),
+  ('comm_delivery',         'community delivery]'),
+  ('env_delivery',         'environmental delivery]'),
+  ('delta_outflow',         'Delta outflow]'),
+  ('carryover',         'reservoir carryover]'),
+  ('other',           'other');
+*/
+
+Table operation_definition {
+  id                   int                 [pk, increment]
+  short_code           text                [not null]
+  name                 text                [not null]
+  category_id          int  [not null]
+  description          text
+  is_active          boolean   [not null, default: true]
+  notes       text
+  operation_version_id int    [not null]
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (is_active)
+    (category_id, short_code)  [unique, note: 'UNIQUE WHERE is_active'] 
+  }
+}
+
+Ref: operation_definition.operation_version_id > version.id [delete: restrict, update: cascade]
+Ref: operation_definition.category_id > operation_category.id [delete: restrict, update: cascade]
+Ref: operation_definition.created_by          > user.id    [delete: restrict, update: cascade]
+Ref: operation_definition.updated_by          > user.id    [delete: restrict, update: cascade]
+
+Table operation_param_priority_allocation {
+  id              int    [pk, increment]
+  operation_id    int    [not null]
+  allocation_type text
+  region_id       int
+  season_id       int
+  detail          jsonb
+
+  Indexes {
+    (operation_id)
+  }
+}
+
+Ref: operation_param_priority_allocation.operation_id  > operation_definition.id [delete: cascade, update: restrict]
+Ref: operation_param_priority_allocation.region_id > region.id [delete: restrict, update: cascade]
+Ref: operation_param_priority_allocation.season_id > season.id [delete: restrict, update: cascade]
+
+Table operation_param_minimum_flow {
+  id            int    [pk, increment]
+  operation_id  int    [not null]
+  tributary     text
+  region_id     int
+  season_id     int
+  flow_regime_id   int
+  flow_target_value   numeric
+  unit_id       int
+  detail        jsonb
+
+  Indexes {
+    (operation_id) 
+    (operation_id, tributary) [unique]
+  }
+}
+
+Ref: operation_param_minimum_flow.operation_id  > operation_definition.id [delete: cascade, update: restrict]
+Ref: operation_param_minimum_flow.region_id > region.id [delete: restrict, update: cascade]
+Ref: operation_param_minimum_flow.season_id > season.id [delete: restrict, update: cascade]
+Ref: operation_param_minimum_flow.flow_regime_id > flow_regime.id [delete: restrict, update: cascade]
+Ref: operation_param_minimum_flow.unit_id > unit.id [delete: restrict, update: cascade]
+
+Table operation_param_infrastructure {
+  id                  int    [pk, increment]
+  operation_id        int    [not null]
+  infrastructure_name text
+  operation_level     text
+  unit_id       int
+  detail          jsonb
+
+  Indexes {
+    (operation_id) 
+    (operation_id, infrastructure_name) [unique]
+  }
+}
+
+Ref: operation_param_infrastructure.operation_id  > operation_definition.id [delete: cascade, update: restrict]
+Ref: operation_param_infrastructure.unit_id > unit.id [delete: restrict, update: cascade]
+
+Table operation_param_regulatory {
+  id             int    [pk, increment]
+  operation_id   int    [not null]
+  regulation_type int
+  regulation_name text
+  detail          jsonb
+
+  Indexes {
+    (operation_id) 
+    (operation_id, regulation_type, regulation_name) [unique]
+  }
+}
+
+Ref: operation_param_regulatory.operation_id  > operation_definition.id [delete: cascade, update: restrict]
+
+Table operation_param_carryover {
+  id             int    [pk, increment]
+  operation_id   int    [not null]
+  reservoir_id int
+  amount numeric
+  unit_id  int
+  detail          jsonb
+
+  Indexes {
+    (operation_id) 
+    (operation_id, reservoir_id, amount) [unique]
+  }
+}
+
+Ref: operation_param_carryover.operation_id  > operation_definition.id [delete: cascade, update: restrict]
+Ref: operation_param_carryover.reservoir_id  > reservoir_entity.id [delete: cascade, update: restrict]
+Ref: operation_param_carryover.unit_id > unit.id [delete: restrict, update: cascade]
+
+Table operation_param_kv {
+  id             int    [pk, increment]
+  operation_id int       [not null]
+  key          text      [not null]
+  value_num     numeric
+  value_txt     text
+  Note: 'CHECK ( (value_num IS NOT NULL)::int + (value_txt IS NOT NULL)::int = 1 )'
+
+  unit_id       int
+  region_id     int
+  season_id     int
+  detail       jsonb
+
+  Indexes {
+    (operation_id, key) [unique]
+  }
+}
+
+Ref: operation_param_kv.operation_id  > operation_definition.id [delete: cascade, update: restrict]
+Ref: operation_param_kv.unit_id > unit.id [delete: restrict, update: cascade]
+Ref: operation_param_kv.region_id > region.id [delete: restrict, update: cascade]
+Ref: operation_param_kv.season_id > season.id [delete: restrict, update: cascade]
+
+Table theme_key_operation_link {
+  theme_id       int [not null]
+  operation_id   int [not null]
+
+  Indexes {
+    (theme_id, operation_id) [pk]
+    (operation_id, theme_id)
+  }
+}
+
+Ref: theme_key_operation_link.theme_id     > theme.id                [delete: restrict, update: cascade]
+Ref: theme_key_operation_link.operation_id > operation_definition.id [delete: restrict, update: cascade]
+
+Table scenario_key_operation_link {
+  scenario_id  uuid [not null]
+  operation_id int  [not null]
+
+  Indexes {
+    (scenario_id, operation_id) [pk]
+    (operation_id, scenario_id)
+  }
+}
+
+Ref: scenario_key_operation_link.scenario_id  > scenario.id           [delete: restrict, update: cascade]
+Ref: scenario_key_operation_link.operation_id > operation_definition.id [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// OUTCOMES
+//────────────────────────────────────────────
+
+Table outcome_category {
+  id          int  [pk, increment]
+  short_code  text [not null, unique]
+  label       text
+  description text
+  outcome_version_id int  [not null]
+  is_active   boolean [default: true]
+
+  created_at  timestamp [default: "now()"]
+  created_by  int
+  updated_at  timestamp
+  updated_by  int
+
+  Indexes { (is_active, short_code) }
+}
+
+Ref: outcome_category.outcome_version_id > version.id           [delete: restrict, update: cascade]
+Ref: outcome_category.created_by         > user.id      [delete: restrict, update: cascade]
+Ref: outcome_category.updated_by         > user.id      [delete: restrict, update: cascade]
+
+Table outcome_measure {
+  id                int  [pk, increment]
+  outcome_category_id       int  [not null] 
+  short_code        text [not null]               
+  name              text [not null]
+  description       text
+  unit_id           int                           
+  temporal_scale_id int                           
+  spatial_scale_id  int                           
+  calc_note         text                          
+  metrics_version_id int [not null]
+  is_active         boolean [default: true]
+
+  created_at  timestamp [default: "now()"]
+  created_by  int
+  updated_at  timestamp
+  updated_by  int
+                               
+  Indexes {
+    (outcome_category_id, short_code) [unique, note: 'UNIQUE WHERE is_active = TRUE']
+    (is_active)
+  }
+}
+
+Ref: outcome_measure.outcome_category_id       > outcome_category.id [delete: restrict, update: cascade]
+Ref: outcome_measure.unit_id           > unit.id             [delete: restrict, update: cascade]
+Ref: outcome_measure.temporal_scale_id > temporal_scale.id   [delete: restrict, update: cascade]
+Ref: outcome_measure.spatial_scale_id  > spatial_scale.id    [delete: restrict, update: cascade]
+Ref: outcome_measure.metrics_version_id > version.id            [delete: restrict, update: cascade]
+Ref: outcome_measure.created_by        > user.id        [delete: restrict, update: cascade]
+Ref: outcome_measure.updated_by        > user.id        [delete: restrict, update: cascade]
+
+Table measure_variable_link {
+  measure_id  int  [not null]
+  variable_id uuid [not null]
+
+  Indexes {
+    (measure_id, variable_id) [pk]   // measure → variable
+    (variable_id, measure_id)        // variable → measure
+  }
+}
+
+Ref: measure_variable_link.measure_id  > outcome_measure.id  [delete: restrict, update: cascade]
+Ref: measure_variable_link.variable_id > calsim_variable.id  [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// LOOKUPS FOR OUTCOME METADATA
+//────────────────────────────────────────────
+
+Table temporal_scale {
+  id          int  [pk, increment]
+  short_code  text [not null, unique]   // 'monthly', 'annual', 'por', 'daily', 'seasonal'
+  label       text [not null]           // 'Monthly', 'Annual', 'Period of Record'
+  description text
+}
+
+Table spatial_scale {
+  id          int  [pk, increment]
+  short_code  text [not null, unique]   // 'demand_unit', 'reservoir', …
+  label       text
+  description text
+}
+
+//────────────────────────────────────────────
+// MAPPING CalSim VARIABLES → OUTCOMES
+//────────────────────────────────────────────
+
+Table outcome_variable_link {             
+  outcome_id  int  [not null]
+  variable_id uuid [not null]
+
+  Indexes {
+    (outcome_id, variable_id) [pk]        // outcome → variable(s)
+    (variable_id, outcome_id)             // variable → outcome
+  }
+}
+
+Ref: outcome_variable_link.outcome_id > outcome_measure.id [delete: restrict, update: cascade]
+Ref: outcome_variable_link.variable_id > calsim_variable.id [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// VALUES
+//────────────────────────────────────────────
+
+Table scenario_variable_statistic {
+  scenario_id        uuid [not null]
+  variable_id        uuid [not null]
+  statistic_type_id  int  [not null]
+  value              numeric [not null]
+  source_version_id  int    [not null]
+
+  created_at  timestamp [default: "now()"]
+  created_by  int
+  updated_at  timestamp
+  updated_by  int
+
+  Indexes {
+    (scenario_id, variable_id, statistic_type_id) [pk]
+    (variable_id, statistic_type_id)
+    (scenario_id, variable_id)
+    (variable_id, scenario_id)
+  }
+}
+
+Ref: scenario_variable_statistic.source_version_id > version.id            [delete: restrict, update: cascade]
+Ref: scenario_variable_statistic.scenario_id         > scenario.id      [delete: restrict, update: cascade]
+Ref: scenario_variable_statistic.variable_id         > calsim_variable.id      [delete: restrict, update: cascade]
+Ref: scenario_variable_statistic.statistic_type_id         > statistic_type.id      [delete: restrict, update: cascade]
+Ref: scenario_variable_statistic.created_by         > user.id      [delete: restrict, update: cascade]
+Ref: scenario_variable_statistic.updated_by         > user.id      [delete: restrict, update: cascade]
+
+Table scenario_measure_statistic {
+  scenario_id        uuid [not null]
+  measure_id         int  [not null]
+  statistic_type_id  int  [not null]
+  value              numeric [not null]
+  source_version_id  int    [not null]
+
+  created_at  timestamp [default: "now()"]
+  created_by  int
+  updated_at  timestamp
+  updated_by  int
+
+  Indexes {
+    (scenario_id, measure_id, statistic_type_id) [pk]
+    (measure_id, statistic_type_id)  // cross-scenario look-ups
+  }
+}
+
+Ref: scenario_measure_statistic.measure_id > outcome_measure.id [delete: restrict, update: cascade]
+Ref: scenario_measure_statistic.source_version_id > version.id            [delete: restrict, update: cascade]
+Ref: scenario_measure_statistic.scenario_id         > scenario.id      [delete: restrict, update: cascade]
+Ref: scenario_measure_statistic.measure_id         > calsim_variable.id      [delete: restrict, update: cascade]
+Ref: scenario_measure_statistic.statistic_type_id         > statistic_type.id      [delete: restrict, update: cascade]
+Ref: scenario_measure_statistic.created_by         > user.id      [delete: restrict, update: cascade]
+Ref: scenario_measure_statistic.updated_by         > user.id      [delete: restrict, update: cascade]
+
+Table scenario_outcome_statistic {
+  scenario_id      uuid [not null]
+  outcome_id       int  [not null]
+  statistic_type_id int  [not null]
+  value            numeric [not null]
+
+  source_version_id int [not null]
+  created_at  timestamp [default: "now()"]
+  created_by  int
+  updated_at  timestamp
+  updated_by  int
+
+  Indexes {
+    (scenario_id, outcome_id, statistic_type_id) [pk]
+    (outcome_id, statistic_type_id)
+  }
+}
+
+Ref: scenario_outcome_statistic.source_version_id > version.id            [delete: restrict, update: cascade]
+Ref: scenario_outcome_statistic.scenario_id         > scenario.id      [delete: restrict, update: cascade]
+Ref: scenario_outcome_statistic.outcome_id         > outcome_measure.id      [delete: restrict, update: cascade]
+Ref: scenario_outcome_statistic.statistic_type_id         > statistic_type.id      [delete: restrict, update: cascade]
+Ref: scenario_outcome_statistic.created_by         > user.id      [delete: restrict, update: cascade]
+Ref: scenario_outcome_statistic.updated_by         > user.id      [delete: restrict, update: cascade]
+
+Table scenario_category_statistic {
+  scenario_id      uuid [not null, ref: > scenario.id]
+  category_id      int  [not null, ref: > outcome_category.id]
+  statistic_type_id int  [not null, ref: > statistic_type.id]
+  value            numeric [not null]
+  source_version_id int [not null, ref: > version.id]
+  created_at  timestamp [default: "now()"]
+  created_by  int
+  updated_at  timestamp
+  updated_by  int
+
+  Indexes {
+    (scenario_id, category_id, statistic_type_id) [pk]
+    (category_id, statistic_type_id)
+  }
+}
+
+Table theme_key_outcome_link {
+  theme_id              int [not null, ref: > theme.id]
+  outcome_definition_id int [not null, ref: > outcome_category.id]
+
+  Indexes { (theme_id, outcome_definition_id) [pk] }
+}
+
+//────────────────────────────────────────────
+// HYDROCLIMATE
+//────────────────────────────────────────────
+
+Table hydroclimate_source {
+  id                      int       [pk, increment]
+  short_code              text      [not null, unique]
+  name                    text
+  description             text
+  citation                text
+  url                     text
+  notes                   text
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes { (short_code) }
+}
+
+Ref: hydroclimate_source.created_by          > user.id    [delete: restrict, update: cascade]
+Ref: hydroclimate_source.updated_by          > user.id    [delete: restrict, update: cascade]
+
+Table hydroclimate {
+  id                      int       [pk, increment]
+  short_code              text      [not null, unique]
+  name                    text
+  description             text
+  is_active               boolean [not null, default: true]
+  projection_year         int
+  slr_value               numeric
+  slr_unit_id             int
+  source_id               int                       // FK → hydroclimate_source.id
+  notes                   text
+  hydroclimate_version_id int
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes { (is_active, short_code) (source_id) }
+}
+
+Ref: hydroclimate.hydroclimate_version_id > version.id            [delete: restrict, update: cascade]
+Ref: hydroclimate.source_id              > hydroclimate_source.id [delete: restrict, update: cascade]
+Ref: hydroclimate.slr_unit_id            > unit.id              [delete: restrict, update: cascade]
+Ref: hydroclimate.created_by             > user.id            [delete: restrict, update: cascade]
+Ref: hydroclimate.updated_by             > user.id            [delete: restrict, update: cascade]
+
+Table hydroclimate_variable_summary {
+  id                  int       [pk, increment]
+  hydroclimate_id     int       [not null]
+  variable_type_id    int [not null]
+  unit_id             int
+  description         text
+  distribution_data   jsonb   
+  variable_version_id int       [not null]
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (hydroclimate_id, variable_type_id) [unique]
+  }
+}
+
+Ref: hydroclimate_variable_summary.variable_type_id > hydroclimate_variable_type.id [delete: restrict, update: cascade]
+Ref: hydroclimate_variable_summary.hydroclimate_id > hydroclimate.id [delete: cascade, update: restrict]
+Ref: hydroclimate_variable_summary.unit_id         > unit.id      [delete: restrict, update: cascade]
+Ref: hydroclimate_variable_summary.variable_version_id > version.id   [delete: restrict, update: cascade]
+Ref: hydroclimate_variable_summary.created_by             > user.id            [delete: restrict, update: cascade]
+Ref: hydroclimate_variable_summary.updated_by             > user.id            [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// CALSIM VARIABLES
+//────────────────────────────────────────────
+
+Table calsim_variable {
+  id                   uuid   [pk]
+  calsim_id            text   [unique]
+  part_b               text
+  part_c               text
+  name                 text
+  description          text
+  entity_type_id       int                          // FK → calsim_entity_type.id (NULL if not entity-based)
+  primary_entity_id    uuid                         // FK → calsim_entity.id (primary entity this variable represents)
+  outcome_category_id  int    [not null]            // FK → outcome_category.id
+  unit_id              int                          // FK → unit.id
+  region_id            int                          // FK → region.id
+  reporting            boolean [not null, default: true]
+  temporal_scale_id    int                          // FK → temporal_scale.id (data generation frequency)
+  variable_type_id     int    [not null]            // FK → variable_type.id ('output', 'control', 'decision', 'state', 'aggregate')
+  variable_version_id  int    [not null]            // FK → version.id
+  
+  // Variable purpose and classification
+  variable_purpose     text                         // 'scenario_flow', 'unimpaired_flow', 'minimum_flow', 'storage_level', 'storage_zone', 'inflow_rate'
+  data_interpretation  text                         // 'actual', 'target', 'constraint', 'historical', 'projected'
+  calculation_method   text                         // How this variable is calculated or derived
+  
+  // Reservoir-specific attributes
+  is_aggregate         boolean [default: false]     // TRUE for variables that aggregate multiple reservoirs
+  aggregated_entities  uuid[]                       // Array of entity IDs that this variable aggregates
+  storage_zone_type    text                         // 'flood_control', 'conservation', 'dead_pool', 'total'
+  operational_purpose  text                         // 'flood_control', 'water_supply', 'environmental', 'recreation'
+  trigger_threshold    numeric                      // Threshold value for operational triggers (e.g., 500 TAF)
+  threshold_units      text                         // Units for trigger threshold
+  
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (calsim_id, reporting)
+    (part_b)
+    (primary_entity_id)                 // Find all variables for an entity
+    (outcome_category_id)
+    (entity_type_id)
+    (variable_type_id)                  // Find variables by type (control, output, etc.)
+    (variable_purpose)                  // Find variables by purpose (scenario_flow, storage_level, etc.)
+    (data_interpretation)               // Find variables by interpretation (actual, target, etc.)
+    (is_aggregate)                      // Find aggregate variables
+    (storage_zone_type)                 // Find variables by storage zone type
+    (operational_purpose)               // Find variables by operational purpose
+  }
+}
+
+Ref: calsim_variable.entity_type_id      > calsim_entity_type.id [delete: restrict, update: cascade]
+Ref: calsim_variable.primary_entity_id   > calsim_entity.id         [delete: set null, update: cascade]
+Ref: calsim_variable.outcome_category_id > outcome_category.id   [delete: restrict, update: cascade]
+Ref: calsim_variable.unit_id             > unit.id               [delete: restrict, update: cascade]
+Ref: calsim_variable.temporal_scale_id   > temporal_scale.id     [delete: restrict, update: cascade]
+Ref: calsim_variable.variable_type_id    > variable_type.id      [delete: restrict, update: cascade]
+Ref: calsim_variable.region_id           > region.id             [delete: restrict, update: cascade]
+Ref: calsim_variable.variable_version_id > version.id               [delete: restrict, update: cascade]
+Ref: calsim_variable.created_by          > user.id          [delete: restrict, update: cascade]
+Ref: calsim_variable.updated_by          > user.id          [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// VARIABLE GROUPING SYSTEM
+//────────────────────────────────────────────
+
+// Define types of variable groups
+Table variable_group_type {
+  id          int    [pk, increment]
+  short_code  text   [not null, unique]   // 'tier_storage', 'reporting', 'analysis', 'dashboard'
+  name        text   [not null]           // 'Tier Storage Variables', 'Reporting Variables'
+  description text
+  is_active   boolean [not null, default: true]
+  
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (short_code) [unique]
+    (is_active, short_code)
+  }
+}
+
+Ref: variable_group_type.created_by > user.id [delete: restrict, update: cascade]
+Ref: variable_group_type.updated_by > user.id [delete: restrict, update: cascade]
+
+// Define specific variable groups
+Table variable_group {
+  id                   int     [pk, increment]
+  group_type_id        int     [not null]           // FK → variable_group_type.id
+  short_code           text    [not null]           // 'tier_storage_reservoirs', 'dashboard_storage'
+  name                 text    [not null]           // 'Tier Storage Reservoirs', 'Dashboard Storage Variables'
+  description          text
+  purpose              text                         // 'Used for tier classification of reservoir storage'
+  selection_criteria   text                         // 'Major storage reservoirs with capacity > 100 TAF'
+  is_active            boolean [not null, default: true]
+  variable_version_id  int     [not null]           // FK → version.id (for versioning group definitions)
+  
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (group_type_id, short_code) [unique]
+    (is_active, group_type_id)
+  }
+}
+
+Ref: variable_group.group_type_id       > variable_group_type.id [delete: restrict, update: cascade]
+Ref: variable_group.variable_version_id > version.id                [delete: restrict, update: cascade]
+Ref: variable_group.created_by          > user.id           [delete: restrict, update: cascade]
+Ref: variable_group.updated_by          > user.id           [delete: restrict, update: cascade]
+
+// Link variables to groups (many-to-many)
+Table variable_group_membership {
+  group_id    int  [not null]           // FK → variable_group.id
+  variable_id uuid [not null]           // FK → calsim_variable.id
+  is_primary  boolean [default: false]  // TRUE if this is a primary/key variable for the group
+  sort_order  int                       // Optional ordering within group
+  notes       text                      // Why this variable is in this group
+  
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (group_id, variable_id) [pk]
+    (variable_id, group_id)       // Find groups for a variable
+    (group_id, sort_order)        // Ordered variables within group
+    (group_id, is_primary)        // Primary variables for group
+  }
+}
+
+Ref: variable_group_membership.group_id    > variable_group.id   [delete: cascade, update: cascade]
+Ref: variable_group_membership.variable_id > calsim_variable.id  [delete: cascade, update: cascade]
+Ref: variable_group_membership.created_by  > user.id     [delete: restrict, update: cascade]
+Ref: variable_group_membership.updated_by  > user.id     [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// SCENARIO OUTCOMES & TIERS
+//────────────────────────────────────────────
+Table outcome_definition {
+  id                 int   [pk, increment]
+  name               text  [unique, not null]
+  description        text
+  units              text
+  method             text
+  source             text
+  metrics_version_id int   [not null]
+  created_at         timestamp [default: "now()"]
+  updated_at         timestamp
+}
+
+Ref: outcome_definition.metrics_version_id > version.id [delete: restrict, update: cascade]
+
+Table tier_definition {
+  id              int  [pk, increment]
+  name            text [not null, unique]
+  description     text
+  rationale       text
+  method          text
+  outcome_measures text[]
+  is_active       boolean   [not null, default: false]
+  tier_version_id int       [not null]
+  created_at      timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at      timestamp [default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (is_active, name)
+  }
+}
+
+Ref: tier_definition.tier_version_id > version.id [delete: restrict, update: cascade]
+Ref: tier_definition.created_by  > user.id   [delete: restrict, update: cascade]
+Ref: tier_definition.updated_by  > user.id   [delete: restrict, update: cascade]
+
+Table tier_level {
+  tier_id             int  [not null]
+  level               int  [not null]
+
+  label               text
+  short_description   text
+  detailed_description text
+  tier_version_id     int  [not null]
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes { (tier_id, level) [pk] }
+}
+Ref: tier_level.tier_id        > tier_definition.id         [delete: cascade,  update: cascade]
+Ref: tier_level.tier_version_id> version.id      [delete: restrict, update: cascade]
+Ref: tier_level.created_by     > user.id [delete: restrict, update: cascade]
+Ref: tier_level.updated_by     > user.id [delete: restrict, update: cascade]
+
+Table tier_outcome_link {
+  tier_id    int [not null]
+  outcome_id int [not null]
+
+  Indexes {
+    (tier_id, outcome_id) [pk]
+    (outcome_id, tier_id)
+  }
+}
+
+Ref: tier_outcome_link.tier_id    > tier_definition.id            [delete: restrict, update: cascade]
+Ref: tier_outcome_link.outcome_id > outcome_definition.id [delete: restrict, update: cascade]
+
+// Link variable groups to tier definitions
+Table tier_variable_group_link {
+  tier_id  int [not null]           // FK → tier_definition.id
+  group_id int [not null]           // FK → variable_group.id
+  
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+
+  Indexes {
+    (tier_id, group_id) [pk]
+    (group_id, tier_id)
+  }
+}
+
+Ref: tier_variable_group_link.tier_id    > tier_definition.id [delete: cascade, update: cascade]
+Ref: tier_variable_group_link.group_id   > variable_group.id  [delete: cascade, update: cascade]
+Ref: tier_variable_group_link.created_by > user.id    [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// METADATA SUBTABLES
+//────────────────────────────────────────────
+Table scenario_metadata {
+  id              uuid   [pk]
+  scenario_id     uuid   [not null]
+  theme_id        int    [not null]
+
+  study_name      text
+  alias           text
+  version         text
+  url             text
+  created         date
+  last_modified   date
+  raw             jsonb  [not null]
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes { (scenario_id) (study_name) (alias) }
+}
+Ref: scenario_metadata.theme_id    > theme.id      [delete: restrict, update: cascade]
+Ref: scenario_metadata.scenario_id > scenario.id   [delete: cascade,  update: restrict]
+Ref: scenario_metadata.created_by  > user.id [delete: restrict, update: cascade]
+Ref: scenario_metadata.updated_by  > user.id [delete: restrict, update: cascade]
+
+Table scenario_ancillary_output {
+  id                   uuid [pk]
+  scenario_metadata_id uuid [not null]
+  output_type          text
+  file_name            text
+  metadata_version_id  int  [not null]
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+}
+Ref: scenario_ancillary_output.scenario_metadata_id > scenario_metadata.id [delete: restrict, update: cascade]
+Ref: scenario_ancillary_output.metadata_version_id  > version.id           [delete: restrict, update: cascade]
+Ref: scenario_ancillary_output.created_by           > user.id     [delete: restrict, update: cascade]
+Ref: scenario_ancillary_output.updated_by           > user.id     [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+//  EXTERNAL MODEL METADATA
+//────────────────────────────────────────────
+Table model_source {
+  id                int   [pk, increment]
+  name              text  [unique, not null]
+  version_family_id int   [not null]
+  description       text
+  contact           text
+  notes             text
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+}
+Ref: model_source.version_family_id > version_family.id [delete: restrict, update: cascade]
+Ref: model_source.created_by        > user.id   [delete: restrict, update: cascade]
+Ref: model_source.updated_by        > user.id   [delete: restrict, update: cascade]
+
+Table model_variable {
+  id                  int   [pk, increment]
+  model_source_id     int   [not null]              
+  short_code          text  [not null]
+  name                text
+  unit_id             int
+  temporal_scale_id   int   [not null]              // FK → temporal_scale.id (data generation frequency)
+  geometry_type_id    int
+  description         text
+  variable_version_id int   [not null]              
+
+  Indexes { (model_source_id, short_code) [unique] }
+}
+
+Ref: model_variable.model_source_id     > model_source.id [delete: restrict, update: cascade]
+Ref: model_variable.variable_version_id > version.id      [delete: restrict, update: cascade]
+Ref: model_variable.unit_id > unit.id [delete: restrict, update: cascade]
+Ref: model_variable.temporal_scale_id > temporal_scale.id [delete: restrict, update: cascade]
+Ref: model_variable.geometry_type_id > geometry_type.id [delete: restrict, update: cascade]
+
+Table model_run {
+  id              uuid [pk]
+  model_source_id int  [not null]
+  scenario_id     uuid [not null]
+  run_timestamp   timestamp [not null]
+  manifest        jsonb
+  notes           text
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes { (model_source_id, scenario_id, run_timestamp) [unique] }
+}
+Ref: model_run.model_source_id > model_source.id [delete: restrict, update: cascade]
+Ref: model_run.scenario_id     > scenario.id     [delete: restrict, update: cascade]
+Ref: model_run.created_by      > user.id [delete: restrict, update: cascade]
+Ref: model_run.updated_by      > user.id [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+//  EXTERNAL MODEL – SCALAR VALUES
+//────────────────────────────────────────────
+
+Table model_value {
+  id                int     [pk, increment]
+  model_run_id      uuid    [not null]
+  variable_id       int     [not null]
+  geometry_id       uuid
+  value             numeric [not null]
+  source_version_id int     [not null]
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes {
+    (model_run_id, variable_id, geometry_id) [unique]
+    (variable_id, geometry_id)
+    (geometry_id)
+  }
+}
+Ref: model_value.model_run_id      > model_run.id      [delete: cascade,  update: cascade]
+Ref: model_value.variable_id       > model_variable.id [delete: restrict, update: cascade]
+Ref: model_value.geometry_id       > geometry.id       [delete: set null, update: cascade]
+Ref: model_value.source_version_id > version.id        [delete: restrict, update: cascade]
+Ref: model_value.created_by        > user.id   [delete: restrict, update: cascade]
+Ref: model_value.updated_by        > user.id   [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// INTERPRETIVE FRAMEWORK
+//────────────────────────────────────────────
+
+Table analysis {
+  id                     int  [pk, increment]
+  name                   text [unique, not null]
+  description            text
+  analysis_type_id       int
+  notes                  text
+  interpretive_version_id int [not null]
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+}
+Ref: analysis.analysis_type_id       > analysis_type.id [delete: restrict, update: cascade]
+Ref: analysis.interpretive_version_id> version.id          [delete: restrict, update: cascade]
+Ref: analysis.created_by             > user.id     [delete: restrict, update: cascade]
+Ref: analysis.updated_by             > user.id     [delete: restrict, update: cascade]
+
+Table key_concept {
+  id                     int  [pk, increment]
+  name                   text [unique, not null]
+  definition             text
+  interpretive_version_id int  [not null]
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+}
+Ref: key_concept.interpretive_version_id > version.id      [delete: restrict, update: cascade]
+Ref: key_concept.created_by              > user.id [delete: restrict, update: cascade]
+Ref: key_concept.updated_by              > user.id [delete: restrict, update: cascade]
+
+Table chart_type {
+  id                     int  [pk, increment]
+  type                   text [unique, not null]
+  interpretive_version_id int  [not null]
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+}
+Ref: chart_type.interpretive_version_id > version.id      [delete: restrict, update: cascade]
+Ref: chart_type.created_by              > user.id [delete: restrict, update: cascade]
+Ref: chart_type.updated_by              > user.id [delete: restrict, update: cascade]
+
+Table ancillary_data {
+  id                       int  [pk, increment]
+  name                     text [unique, not null]
+  data                     json
+  description              text
+  source                   text
+  interpretive_version_id  int  [not null]
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+}
+Ref: ancillary_data.interpretive_version_id > version.id      [delete: restrict, update: cascade]
+Ref: ancillary_data.created_by              > user.id [delete: restrict, update: cascade]
+Ref: ancillary_data.updated_by              > user.id [delete: restrict, update: cascade]
+
+Table theme_key_concept_link {
+  theme_id       int [not null]
+  key_concept_id int [not null]
+
+  Indexes {
+    (theme_id, key_concept_id) [pk]
+    (key_concept_id, theme_id)
+  }
+}
+
+Ref: theme_key_concept_link.theme_id       > theme.id       [delete: restrict, update: cascade]
+Ref: theme_key_concept_link.key_concept_id > key_concept.id [delete: restrict, update: cascade]
+
+Table theme_chart_type_link {
+  theme_id     int [not null]
+  chart_type_id int [not null]
+
+  Indexes {
+    (theme_id, chart_type_id) [pk]
+    (chart_type_id, theme_id)
+  }
+}
+
+Ref: theme_chart_type_link.theme_id     > theme.id     [delete: restrict, update: cascade]
+Ref: theme_chart_type_link.chart_type_id > chart_type.id [delete: restrict, update: cascade]
+
+Table theme_ancillary_data_link {
+  theme_id          int [not null]
+  ancillary_data_id int [not null]
+
+  Indexes {
+    (theme_id, ancillary_data_id) [pk]
+    (ancillary_data_id, theme_id)
+  }
+}
+
+Ref: theme_ancillary_data_link.theme_id          > theme.id          [delete: restrict, update: cascade]
+Ref: theme_ancillary_data_link.ancillary_data_id > ancillary_data.id [delete: restrict, update: cascade]
+
+Table theme_analysis_link {
+  theme_id    int [not null]
+  analysis_id int [not null]
+
+  Indexes {
+    (theme_id, analysis_id) [pk]
+    (analysis_id, theme_id)
+  }
+}
+
+Ref: theme_analysis_link.theme_id    > theme.id    [delete: restrict, update: cascade]
+Ref: theme_analysis_link.analysis_id > analysis.id [delete: restrict, update: cascade]
+
+// Link themes to variable groups (what variables are key for each theme)
+Table theme_variable_group_link {
+  theme_id int [not null]           // FK → theme.id
+  group_id int [not null]           // FK → variable_group.id
+  
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+
+  Indexes {
+    (theme_id, group_id) [pk]
+    (group_id, theme_id)
+  }
+}
+
+Ref: theme_variable_group_link.theme_id    > theme.id         [delete: cascade, update: cascade]
+Ref: theme_variable_group_link.group_id    > variable_group.id [delete: cascade, update: cascade]
+Ref: theme_variable_group_link.created_by  > user.id  [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// GEOMETRY & CONSTANTS
+//────────────────────────────────────────────
+Table geometry {
+  id                 uuid   [pk]
+  name               text
+  geometry_type_id   int    [not null]        // FK → geometry_type.id
+  geom               geometry(Geometry,4326)
+  geometries_version_id int [not null]
+
+  created_at  timestamp [not null, default: "now()"]
+  created_by  int      [not null]
+  updated_at  timestamp [not null, default: "now()"]
+  updated_by  int      [not null]
+
+  Indexes { (geom) [type: gist] }
+}
+
+Ref: geometry.geometry_type_id       > geometry_type.id [delete: restrict, update: cascade]
+Ref: geometry.geometries_version_id  > version.id          [delete: restrict, update: cascade]
+Ref: geometry.created_by             > user.id     [delete: restrict, update: cascade]
+Ref: geometry.updated_by             > user.id     [delete: restrict, update: cascade]
+
+Table geometry_lookup {
+  id            uuid   [pk]
+  geometry_id   uuid   [not null]
+  variable_id   uuid   [not null]
+  attribute_name text
+  value         numeric
+
+  Indexes {
+    (geometry_id)
+    (variable_id)
+  }
+}
+
+Ref: geometry_lookup.geometry_id > geometry.id [delete: cascade, update: cascade]
+Ref: geometry_lookup.variable_id > calsim_variable.id [delete: restrict, update: cascade]
+
+Table node {
+  id              uuid [pk]
+  name            text
+  geometry_type_id int  // null-able
+  geom            geometry(Point,4326) [not null]
+
+  Indexes { (geom) [type: gist] }
+}
+
+Ref: node.geometry_type_id > geometry_type.id [delete: restrict, update: cascade]
+
+Table arc {
+  id              uuid [pk]
+  from_node_id    uuid [not null, ref: > node.id]
+  to_node_id      uuid [not null, ref: > node.id]
+  geometry_type_id int  // optional
+  geom            geometry(LineString,4326) [not null]
+  metadata        json
+
+  Indexes {
+    (from_node_id)
+    (to_node_id)
+    (geom) [type: gist]
+  }
+}
+
+Ref: arc.geometry_type_id > geometry_type.id [delete: restrict, update: cascade]
+
+Table geometry_attributes_node {
+  id                  uuid   [pk]
+  geometry_id         uuid   [not null]
+  sub_type            text
+  region_id           int
+  shape_length        numeric
+  Indexes { (geometry_id) [unique] }
+}
+
+Ref: geometry_attributes_node.geometry_id > geometry.id [delete: cascade, update: restrict]
+Ref: geometry_attributes_node.region_id > region.id [delete: restrict, update: cascade]
+
+Table geometry_attributes_arc {
+  id                 uuid   [pk]
+  geometry_id        uuid   [not null]
+  arc_description    text
+  from_node          text
+  to_node            text
+  shape_length       numeric
+  Indexes { (geometry_id) [unique] }
+}
+
+Ref: geometry_attributes_arc.geometry_id > geometry.id [delete: cascade, update: restrict]
+
+Table geometry_attributes_demand_unit {
+  id           uuid   [pk]
+  geometry_id  uuid   [not null]
+  crop_type    text
+  region_id    int
+  area_ha      numeric
+  Indexes { (geometry_id) [unique] }
+}
+
+Ref: geometry_attributes_demand_unit.geometry_id > geometry.id [delete: cascade, update: restrict]
+Ref: geometry_attributes_demand_unit.region_id > region.id [delete: restrict, update: cascade]
+
+Table constant {
+  id                   uuid   [pk]
+  label                text
+  year                 int
+  value                text
+  source               text
+  metadata_version_id  int    [not null]
+  Indexes { (label, year) [unique] }
+}
+
+Ref: constant.metadata_version_id > version.id [delete: restrict, update: cascade]
+
+//────────────────────────────────────────────
+// CALSIM VARIABLE TIMESERIES (RAW OUTPUT)
+//────────────────────────────────────────────
+Table scenario_variable_timeseries {
+  scenario_id uuid      [not null, ref: > scenario.id]
+  variable_id uuid      [not null, ref: > calsim_variable.id]
+  timestamp   timestamp [not null]
+  value       numeric   [not null]
+  created_at  timestamp [not null, default: "now()"]
+
+  Indexes {
+    (scenario_id, variable_id, timestamp) [unique]
+  }
+}
+
+//────────────────────────────────────────────
+// SCENARIO OUTCOME RESULTS (AGGREGATES)
+//────────────────────────────────────────────
+Table scenario_outcome_value {
+  scenario_id uuid  [not null, ref: > scenario.id]
+  outcome_id  int   [not null, ref: > outcome_definition.id]
+  geometry_id uuid  [ref: > geometry.id]
+  time_period      text                        
+  stat        statistic_type [not null]
+  value       numeric      [not null]
+  created_at  timestamp    [default: "now()"]
+
+  Indexes {
+    (scenario_id, outcome_id, geometry_id, time_period, stat) [unique]
+  }
+}
+
+Table scenario_tier_value {
+  scenario_id   uuid  [ref: > scenario.id]
+  outcome_id    int   [ref: > outcome_definition.id, note: 'NULL → row is for variable']
+  variable_id   uuid  [ref: > calsim_variable.id,    note: 'NULL → row is for outcome']
+  tier_id       int   [not null, ref: > tier_definition.id]
+  level         int   [not null, note: '1-4']
+  geometry_id   uuid  [ref: > geometry.id]
+  time_period   text  [not null]
+
+  source_version_id int  [not null, ref: > version.id]
+  created_by  int [not null, ref: > user.id]
+  created_at        timestamp [default: "now()"]
+  updated_at        timestamp
+
+  Note: 'CHECK ( (outcome_id IS NOT NULL)::int + (variable_id IS NOT NULL)::int = 1 )'
+
+  Indexes {
+    // Composite "business key" (acts as PK in dbdiagram)
+    (scenario_id, outcome_id, variable_id, tier_id, geometry_id, time_period) [pk]
+
+    // Helper indexes (had to write the WHERE in a note so DBML parses)
+    (scenario_id, outcome_id)  [note: 'Postgres partial index WHERE outcome_id IS NOT NULL']
+    (scenario_id, variable_id) [note: 'Postgres partial index WHERE variable_id IS NOT NULL']
+  }
+}
+
+//────────────────────────────────────────────
+//  CO‑BENEFITS / TRADE‑OFFS / LARGE DELTAS
+//────────────────────────────────────────────
+
+Table scenario_outcome_delta {
+  id                     int   [pk, increment]
+
+  scenario_id            uuid  [not null, ref: > scenario.id]
+  baseline_scenario_id   uuid  [not null, ref: > scenario.id]
+  outcome_id             int   [not null, ref: > outcome_definition.id]
+
+  stat                   text         
+  value                  numeric     
+
+  analysis_type_id       int
+  rationale              text        
+  significance_flag      boolean       // TRUE = flagged as "key" in dashboards
+
+  created_at             timestamp [default: "now()"]
+
+  Indexes {
+    (scenario_id, outcome_id, stat) [unique]   
+    (analysis_type_id)
+  }
+}
+
+Ref: scenario_outcome_delta.analysis_type_id > analysis_type.id [delete: restrict, update: cascade]
+
+Table analysis_result_delta {
+  analysis_id int [not null]
+  delta_id    int [not null]
+
+  Indexes { (analysis_id, delta_id) [pk] }
+}
+
+Ref: analysis_result_delta.analysis_id > analysis.id [delete: cascade, update: cascade]
+Ref: analysis_result_delta.delta_id > scenario_outcome_delta.id [delete: cascade, update: cascade]
+
+
+
+//────────────────────────────────────────────
+// ENTITY-SPECIFIC TABLES & THEIR VARIABLES
+//────────────────────────────────────────────
+
+//═══════════════════════════════════════════════
+// 1. RESERVOIR ENTITIES AND VARIABLES
+//═══════════════════════════════════════════════
+
+Table reservoir_entity {
+  id                   int    [pk, increment]
+  short_code           text   [not null, unique]      // 'SHSTA', 'OROVL', 'FOLSM'
+  name                 text   [not null]              // 'Shasta Reservoir', 'Lake Oroville'
+  description          text                            
+  associated_river     text                          // 'Sacramento River', 'Feather River'
+  entity_type_id       int    [not null]              // FK → calsim_entity_type.id (currently "reservoir")
+  schematic_type_id    int    [not null]              // FK → calsim_schematic_type.id (currently "node")
+  hydrologic_region_id int                             // FK → hydrologic_region.id (SAC, SJR)
+  
+  // Physical characteristics
+  capacity_taf         numeric                         // Total capacity in TAF
+  dead_pool_taf        numeric                         // Dead pool storage in TAF
+  surface_area_acres   numeric                         // Surface area in acres
+  reservoir_type       text                            // 'storage', 'regulating', 'detention', 'afterbay'
+  has_gis_data         boolean [default: false]       // Whether entity has spatial/geographic data
+  
+  // Classification flags
+  has_tiers            boolean [not null, default: false]  // TRUE for reservoirs with tier classifications
+  is_main_reservoir    boolean [not null, default: false]  // TRUE for main/primary reservoirs in system
+  
+  // Link to unified entity system (for future migration)
+  entity_id            uuid                            // FK → calsim_entity.id (nullable during transition)
+  
+  // Standard metadata
+  created_at           timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at           timestamp
+  updated_by  int
+
+  Indexes {
+    (short_code) [unique]                              
+    (entity_id) [unique]                               // Entity-based lookup (when not null)
+    (hydrologic_region_id)
+    (has_gis_data)                                     // Find reservoirs with/without GIS data
+    (has_tiers)                                        // Find tier reservoirs
+    (is_main_reservoir)                                // Find main reservoirs
+    (associated_river)                                 // Find reservoirs by river
+    (reservoir_type)
+  }
+
+  Note: 'Reservoir entities with their physical characteristics and operational attributes'
+}
+
+Ref: reservoir_entity.entity_type_id       > calsim_entity_type.id [delete: restrict, update: cascade]
+Ref: reservoir_entity.schematic_type_id    > calsim_schematic_type.id [delete: restrict, update: cascade]
+Ref: reservoir_entity.hydrologic_region_id > hydrologic_region.id  [delete: restrict, update: cascade]
+Ref: reservoir_entity.entity_id            > calsim_entity.id         [delete: set null, update: cascade]
+Ref: reservoir_entity.created_by           > user.id          [delete: restrict, update: cascade]
+Ref: reservoir_entity.updated_by           > user.id          [delete: restrict, update: cascade]
+
+Table reservoir_variable {
+  id                   int    [pk, increment]
+  calsim_id            text   [not null, unique]      // 'S_SHSTA', 'S_SHSTA_1', 'S_SHSTA_2'
+  name                 text   [not null]              // 'Shasta Total Storage', 'Shasta Flood Control Zone'
+  description          text                           // Detailed description
+  
+  // Link to reservoir entity
+  reservoir_entity_id  int    [not null]              // FK → reservoir_entity.id
+  primary_entity_short_code text                      // Short code of primary entity this variable represents
+  
+  // Variable classification
+  variable_type        text   [not null]              // 'storage_level', 'storage_zone', 'decision', 'state'
+  storage_zone_type    text                           // 'total', 'flood_control', 'conservation', 'dead_pool', 'delta_reserve', 'carryover'
+  operational_purpose  text                           // 'water_supply', 'flood_control', 'power_generation', 'water_quality'
+  
+  // Aggregation attributes
+  is_aggregate         boolean [default: false]       // TRUE for variables that aggregate multiple reservoirs
+  aggregated_entities  text[]                         // Array of entity short codes that this variable aggregates
+  
+  // Operational thresholds
+  trigger_threshold    numeric                        // Threshold value for operational triggers (e.g., 500 TAF)
+  threshold_units      text                           // Units for trigger threshold
+  
+  // Linkage and metadata
+  outcome_category_short_code text                    // FK reference to outcome_category
+  unit_id              int                            // FK → unit.id
+  temporal_scale_id    int                            // FK → temporal_scale.id (monthly, daily, etc.)
+  variable_version_id  int    [not null]              // FK → version.id
+  
+  // Standard metadata
+  created_at           timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at           timestamp
+  updated_by  int
+
+  Indexes {
+    (calsim_id) [unique]
+    (reservoir_entity_id)                             // Find all variables for a reservoir
+    (variable_type)                                   // Find variables by type (storage_level, storage_zone, etc.)
+    (storage_zone_type)                               // Find variables by storage zone
+    (operational_purpose)                             // Find variables by operational purpose
+    (is_aggregate)                                    // Find aggregate variables
+  }
+
+  Note: 'Storage and operational variables associated with reservoir entities'
+}
+
+Ref: reservoir_variable.reservoir_entity_id > reservoir_entity.id     [delete: cascade, update: cascade]
+Ref: reservoir_variable.unit_id             > unit.id                 [delete: restrict, update: cascade]
+Ref: reservoir_variable.variable_version_id > version.id                 [delete: restrict, update: cascade]
+Ref: reservoir_variable.created_by          > user.id          [delete: restrict, update: cascade]
+Ref: reservoir_variable.updated_by          > user.id          [delete: restrict, update: cascade]
+Ref: reservoir_variable.temporal_scale_id      > temporal_scale.id    [delete: restrict, update: cascade]
+
+
+//═══════════════════════════════════════════════
+// 2. INFLOW ENTITIES AND VARIABLES  
+//═══════════════════════════════════════════════
+
+Table inflow_entity {
+  id                   int    [pk, increment]
+  short_code           text   [not null, unique]      // 'I_SHSTA', 'I_OROVL', 'I_FOLSM'
+  name                 text   [not null]              // 'Shasta Lake Inflow', 'Lake Oroville Inflow'
+  description          text                           // Detailed description from CalSim manual
+  to_node              text   [not null]              // Downstream node ID where inflow enters
+  has_gis_data         boolean [default: false]      // Whether entity has spatial/geographic data
+  entity_type_id       int    [not null]              // FK → calsim_entity_type.id (currently "inflow")
+  schematic_type_id    int    [not null]              // FK → calsim_schematic_type.id (currently "arc")
+  hydrologic_region_id int                            // FK → hydrologic_region.id (SAC, SJR)
+  
+  // Link to unified entity system
+  entity_id            uuid                           // FK → calsim_entity.id (unified entity this inflow belongs to)
+  
+  // Standard metadata
+  created_at           timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at           timestamp
+  updated_by  int
+
+  Indexes {
+    (short_code) [unique]                             // Primary lookup
+    (to_node)                                         // Find inflows by destination node
+    (entity_type_id)                                  // Find inflows by entity type
+    (schematic_type_id)                               // Find inflows by schematic type
+    (hydrologic_region_id)                            // Find inflows by region
+    (has_gis_data)                                    // Find inflows with/without GIS data
+    (entity_id)                                       // Link to entity system
+  }
+
+  Note: 'Inflow points where water enters the CalSim system. All are arcs in the schematic'
+}
+
+Ref: inflow_entity.entity_type_id      > calsim_entity_type.id [delete: restrict, update: cascade]
+Ref: inflow_entity.schematic_type_id   > calsim_schematic_type.id [delete: restrict, update: cascade]
+Ref: inflow_entity.hydrologic_region_id > hydrologic_region.id [delete: restrict, update: cascade]
+Ref: inflow_entity.entity_id            > calsim_entity.id        [delete: set null, update: cascade]
+Ref: inflow_entity.created_by           > user.id          [delete: restrict, update: cascade]
+Ref: inflow_entity.updated_by           > user.id          [delete: restrict, update: cascade]
+
+Table inflow_variable {
+  id                   int    [pk, increment]
+  calsim_id            text   [not null, unique]      // 'I_SHSTA', 'I_OROVL', 'I_FOLSM'
+  name                 text   [not null]              // 'Shasta Lake inflow rate'
+  description          text                           // Detailed description from CalSim manual
+  
+  // Link to inflow entity
+  inflow_entity_id     int    [not null]              // FK → inflow_entity.id
+  
+  // Variable classification
+  variable_type        text   [not null]              // 'inflow_rate', 'historical_inflow', 'projected_inflow'
+  
+  // Technical attributes
+  unit_id              int                            // FK → unit.id (typically CFS)
+  temporal_scale_id    int                            // FK → temporal_scale.id (monthly, daily, etc.)
+  variable_version_id  int    [not null]              // FK → version.id
+  
+  // Linkage
+  outcome_category_short_code text                    // FK reference to outcome_category
+  variable_id          uuid                           // FK → calsim_variable.id (link to main variable record)
+  
+  // Standard metadata
+  created_at           timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at           timestamp
+  updated_by  int
+
+  Indexes {
+    (calsim_id) [unique]                             // Primary CalSim3 lookup
+    (inflow_entity_id)                               // Find variables for an inflow entity
+    (variable_type)                                  // Find variables by type
+    (variable_id) [unique]                           // Link to main variable system (one-to-one)
+  }
+
+  Note: 'Inflow rate variables (I_*) that measure water inputs to the system'
+}
+
+Ref: inflow_variable.inflow_entity_id       > inflow_entity.id     [delete: cascade, update: cascade]
+Ref: inflow_variable.unit_id                > unit.id              [delete: restrict, update: cascade]
+Ref: inflow_variable.temporal_scale_id      > temporal_scale.id    [delete: restrict, update: cascade]
+Ref: inflow_variable.variable_version_id    > version.id              [delete: restrict, update: cascade]
+Ref: inflow_variable.variable_id            > calsim_variable.id   [delete: set null, update: cascade]
+Ref: inflow_variable.created_by             > user.id          [delete: restrict, update: cascade]
+Ref: inflow_variable.updated_by             > user.id          [delete: restrict, update: cascade]
+
+//═══════════════════════════════════════════════
+// 3. CHANNEL ENTITIES AND VARIABLES
+//═══════════════════════════════════════════════
+
+Table channel_entity {
+  id                   int    [pk, increment]
+  short_code           text   [not null, unique]      // 'SAC123', 'SJR456', 'C_AMR015'
+  name                 text   [not null]              // 'Sacramento River Section 123', 'American River'
+  description          text                           
+  
+  // Channel classification
+  sub_type            text                           // 'Stream', 'Canal', 'Bypass', 'Aqueduct'
+  entity_type_id      int    [not null]              // FK → calsim_entity_type.id (currently "channel")
+  schematic_type_id   int    [not null]              // FK → calsim_schematic_type.id (currently "arc")
+  
+  // Network topology
+  from_node           text                           // Upstream node ID
+  to_node             text                           // Downstream node ID
+  
+  // Regional classification
+  hydrologic_region_id int                           // FK → hydrologic_region.id
+  
+  // Physical characteristics
+  shape_length_meters decimal                        // Length in meters from GIS
+  
+  // GIS and naming attributes
+  has_gis_data        boolean [default: false]      // Whether variable has GIS data
+  naming_convention   text                           // Naming convention pattern
+  naming_prefix       text                           // Prefix extracted from calsim_id (e.g. "SAC", "AMR")
+  
+  has_tiers            boolean [not null, default: false]  // TRUE for channels with tier classifications
+  is_main_channel    boolean [not null, default: false]  // TRUE for main/primary channels in system
+  
+  // Link to unified entity system
+  entity_id           uuid                           // FK → calsim_entity.id (unified entity this channel belongs to)
+  
+  // Standard metadata
+  created_at          timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at          timestamp
+  updated_by  int
+
+  Indexes {
+    (short_code) [unique]
+    (entity_type_id)                                  // Find channels by entity type
+    (schematic_type_id)                               // Find channels by schematic type
+    (hydrologic_region_id)
+    (entity_id)
+    (naming_prefix)
+    (has_gis_data)
+    (sub_type)
+    (from_node)
+    (to_node)
+  }
+
+  Note: 'Channel/stream/canal segments that convey water through the system'
+}
+
+Ref: channel_entity.entity_type_id      > calsim_entity_type.id [delete: restrict, update: cascade]
+Ref: channel_entity.schematic_type_id   > calsim_schematic_type.id [delete: restrict, update: cascade]
+Ref: channel_entity.hydrologic_region_id > hydrologic_region.id [delete: restrict, update: cascade]
+Ref: channel_entity.entity_id            > calsim_entity.id        [delete: set null, update: cascade]
+Ref: channel_entity.created_by           > user.id          [delete: restrict, update: cascade]
+Ref: channel_entity.updated_by           > user.id          [delete: restrict, update: cascade]
+
+Table channel_variable {
+  id                   int    [pk, increment]
+  calsim_id            text   [not null, unique]      // 'C_SAC123', 'UI_SAC123', 'MF_SAC123'
+  name                 text   [not null]              // 'Sacramento River flow', 'Sacramento River unimpaired flow'
+  description          text                           
+  
+  // Link to channel entity
+  channel_entity_id    int    [not null]              // FK → channel_entity.id
+  
+  // Variable classification - THIS IS KEY FOR YOUR USE CASE
+  variable_purpose     text   [not null]              // 'scenario_flow', 'unimpaired_flow', 'minimum_flow'
+  
+  // Flow characteristics
+  flow_type           text                           // 'main_channel', 'tributary', 'return_flow', 'bypass'
+  
+  // Technical attributes
+  unit_id             int                            // FK → unit.id (typically CFS)
+  temporal_scale_id   int                            // FK → temporal_scale.id (monthly, daily, etc.)
+  variable_version_id int    [not null]              // FK → version.id
+  
+  // Regulatory/operational
+  is_regulatory       boolean [default: false]       // TRUE for minimum instream flow requirements
+  regulatory_authority text                          // Agency setting the requirement
+  
+  // Linkage
+  outcome_category_short_code text                    // FK reference to outcome_category
+  variable_id         uuid                           // FK → calsim_variable.id (link to main variable record)
+  
+  // Standard metadata
+  created_at          timestamp [default: "now()"]
+  created_by  int      [not null]
+  updated_at          timestamp
+  updated_by  int
+
+  Indexes {
+    (calsim_id) [unique]
+    (channel_entity_id)                               // Find variables for a channel entity
+    (variable_purpose)                                // Find by purpose: scenario_flow, unimpaired_flow, minimum_flow
+    (flow_type)                                       // Find by flow type
+    (is_regulatory)                                   // Find regulatory requirements
+    (variable_id)                                     // Link to main variable system
+  }
+
+  Note: 'Flow variables for channels including scenario flow, unimpaired flow, and minimum instream flow'
+}
+
+Ref: channel_variable.channel_entity_id     > channel_entity.id    [delete: cascade, update: cascade]
+Ref: channel_variable.unit_id               > unit.id              [delete: restrict, update: cascade]
+Ref: channel_variable.temporal_scale_id     > temporal_scale.id    [delete: restrict, update: cascade]
+Ref: channel_variable.variable_version_id   > version.id              [delete: restrict, update: cascade]
+Ref: channel_variable.variable_id           > calsim_variable.id   [delete: set null, update: cascade]
+Ref: channel_variable.created_by            > user.id          [delete: restrict, update: cascade]
+Ref: channel_variable.updated_by            > user.id          [delete: restrict, update: cascade]
+
+//═══════════════════════════════════════════════
+// 4. ENTITY VARIABLES → OUTCOME LINKAGE
+//═══════════════════════════════════════════════
+
+/*
+OUTCOME FLOW:
+
+1. ENTITY TABLES → VARIABLE TABLES → OUTCOME STATISTICS
+
+   Physical Entities                Variable Tables                  Outcome Statistics
+   ─────────────────              ──────────────────               ─────────────────────
+   
+   reservoir_entity     ────→      reservoir_variable      ────→    scenario_variable_statistic
+   │                               │                               │
+   ├─ SHSTA                        ├─ S_SHSTA                      └─ Storage statistics per scenario
+   ├─ OROVL                        ├─ S_SHSTA_1                    
+   └─ FOLSM                        └─ S_OROVL                      
+   
+   inflow_entity        ────→      inflow_variable         ────→    scenario_variable_statistic
+   │                               │                               │
+   ├─ I_SHSTA                      ├─ I_SHSTA                      └─ Inflow statistics per scenario
+   ├─ I_OROVL                      ├─ I_OROVL                      
+   └─ I_FOLSM                      └─ I_FOLSM                      
+   
+   channel_entity       ────→      channel_variable        ────→    scenario_variable_statistic
+   │                               │                               │
+   ├─ SAC123                       ├─ C_SAC123 (scenario_flow)     └─ Flow statistics per scenario
+   │                               ├─ C_SAC123_UNIMPAIRED (unimpaired_flow) 
+   │                               └─ C_SAC123_MIF (minimum_instream_flow)  
+   └─ SJR456                       
+   
+2. KEY LINKING FIELDS:
+
+   All variable tables have:
+   - variable_id (uuid) → links to calsim_variable.id
+   - outcome_category_short_code → links to outcome_category.short_code
+   
+   This enables queries like:
+   ```sql
+   -- Find all scenario statistics for Shasta storage variables
+   SELECT sv.scenario_id, rv.name, sv.statistic_type_id, sv.value
+   FROM reservoir_variable rv
+   JOIN calsim_variable cv ON rv.variable_id = cv.id
+   JOIN scenario_variable_statistic sv ON cv.id = sv.variable_id
+   WHERE rv.reservoir_entity_id = (
+     SELECT id FROM reservoir_entity WHERE short_code = 'SHSTA'
+   );
+   
+   -- Compare scenario flow vs unimpaired flow for Sacramento River
+   SELECT 
+     cv.calsim_id,
+     chv.variable_purpose,
+     sv.statistic_type_id,
+     sv.value
+   FROM channel_variable chv
+   JOIN calsim_variable cv ON chv.variable_id = cv.id  
+   JOIN scenario_variable_statistic sv ON cv.id = sv.variable_id
+   WHERE chv.channel_entity_id = (
+     SELECT id FROM channel_entity WHERE short_code = 'SAC123'
+   )
+   AND chv.variable_purpose IN ('scenario_flow', 'unimpaired_flow')
+   ORDER BY chv.variable_purpose, sv.statistic_type_id;
+   ```
+
+3. OUTCOME MEASURES:
+
+   Variables can also link to outcome_measure for aggregated metrics:
+   - measure_variable_link connects calsim_variable → outcome_measure
+   - scenario_measure_statistic stores calculated outcome statistics
+   
+   This enables outcome-based analysis across multiple variables.
+*/

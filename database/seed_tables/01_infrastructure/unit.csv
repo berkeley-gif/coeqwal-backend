@@ -1,0 +1,5 @@
+id,short_code,full_name,canonical_group
+1,TAF,thousand acre-feet,volume
+2,CFS,cubic feet per second,flow
+3,acres,acres,area
+4,mm,millimeters,length

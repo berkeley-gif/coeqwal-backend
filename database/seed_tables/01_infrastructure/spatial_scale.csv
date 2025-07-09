@@ -1,0 +1,12 @@
+id,short_code,label,description
+1,system_wide,System-wide,Entire CalSim system
+2,regional,Regional,Hydrologic region (SAC SJR etc.)
+3,reservoir,Reservoir,Individual reservoir
+4,river_reach,River reach,Specific river reach or segment
+5,demand_unit,Demand unit,Individual demand unit
+6,county,County,County-level aggregation
+7,water_system,Water system,Local water system
+8,basin,Basin,Watershed or hydrologic basin
+9,delta,Delta,Sacramento-San Joaquin Delta
+10,node,Node,Individual CalSim node
+11,arc,Arc,Individual CalSim arc 
